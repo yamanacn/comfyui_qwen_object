@@ -983,6 +983,151 @@ class QwenObjectDetection:
         return (json_output, bboxes_only)
 
 
+class QwenLoadLocalModel:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model_name": ([
+                    "Qwen/Qwen2.5-VL-3B-Instruct",
+                    "Qwen/Qwen2.5-VL-7B-Instruct",
+                    "Qwen/Qwen2.5-VL-32B-Instruct",
+                    "Qwen/Qwen2.5-VL-72B-Instruct",
+                ], ),
+                "device": ([
+                    "auto",
+                    "cuda:0",
+                    "cuda:1",
+                    "cpu",
+                ], ),
+                "precision": ([
+                    "INT4",
+                    "INT8",
+                    "BF16",
+                    "FP16",
+                    "FP32",
+                ], ),
+                "attention": ([
+                    "flash_attention_2",
+                    "sdpa",
+                ], ),
+            }
+        }
+
+    RETURN_TYPES = ("QWEN_MODEL",)
+    RETURN_NAMES = ("qwen_model",)
+    FUNCTION = "load"
+    CATEGORY = "Qwen2.5-VL"
+
+    def load(self, model_name: str, device: str, precision: str, attention: str):
+        # 保存原始参数，用于后续可能的重新加载
+        original_params = {
+            "model_name": model_name,
+            "device": device,
+            "precision": precision,
+            "attention": attention,
+            "offline_mode": True  # 固定为离线模式
+        }
+        model_dir = os.path.join(folder_paths.models_dir, "Qwen", model_name.replace("/", "_"))
+        
+        # 检查本地目录是否已存在
+        model_exists_locally = os.path.exists(model_dir) and any(os.listdir(model_dir))
+        
+        # 如果本地不存在模型，则自动下载
+        if not model_exists_locally:
+            print(f"本地模型不存在 '{model_dir}'，将自动下载...")
+            max_retries = 3
+            retry_delay = 5  # 秒
+            success = False
+            
+            for attempt in range(max_retries):
+                try:
+                    snapshot_download(
+                        repo_id=model_name,
+                        local_dir=model_dir,
+                        local_dir_use_symlinks=False,
+                        resume_download=True,
+                    )
+                    success = True
+                    print(f"成功下载模型: {model_name}")
+                    break
+                except (requests.exceptions.SSLError, requests.exceptions.ConnectionError) as e:
+                    if attempt < max_retries - 1:
+                        print(f"SSL/连接错误，将在{retry_delay}秒后重试 ({attempt+1}/{max_retries})...")
+                        print(f"错误详情: {e}")
+                        time.sleep(retry_delay)
+                        retry_delay *= 2  # 指数退避策略
+                    else:
+                        raise ValueError(f"下载模型失败，已达到最大重试次数。错误: {e}")
+                except Exception as e:
+                    print(f"下载时发生其他错误: {e}")
+                    traceback.print_exc()
+                    if attempt < max_retries - 1:
+                        print(f"将在{retry_delay}秒后重试...")
+                        time.sleep(retry_delay)
+                        retry_delay *= 2
+                    else:
+                        raise ValueError(f"下载模型失败: {e}")
+            
+            if not success:
+                raise ValueError(f"无法下载模型: {model_name}")
+        else:
+            print(f"使用现有本地模型 '{model_dir}'")
+            
+        if device == "auto":
+            device_map = "auto"
+        elif device == "cpu":
+            device_map = {"": "cpu"}
+        else:
+            device_map = {"": device}
+
+        precision = precision.upper()
+        dtype_map = {
+            "BF16": torch.bfloat16,
+            "FP16": torch.float16,
+            "FP32": torch.float32,
+        }
+        torch_dtype = dtype_map.get(precision, torch.bfloat16)
+        quant_config = None
+        if precision == "INT4":
+            quant_config = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_use_double_quant=True)
+        elif precision == "INT8":
+            quant_config = BitsAndBytesConfig(load_in_8bit=True)
+
+        attn_impl = attention
+        if precision == "FP32" and attn_impl == "flash_attention_2":
+            # FlashAttention doesn't support fp32. Fall back to SDPA.
+            attn_impl = "sdpa"
+
+        try:
+            model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                model_dir,
+                torch_dtype=torch_dtype,
+                quantization_config=quant_config,
+                device_map=device_map,
+                attn_implementation=attn_impl,
+                trust_remote_code=True,
+                use_cache=True,
+                local_files_only=model_exists_locally,  # 如果是新下载的，允许在线检查
+            )
+        except Exception as e:
+            raise RuntimeError(f"加载模型失败: {e}")
+        
+        try:
+            processor = AutoProcessor.from_pretrained(
+                model_dir,
+                trust_remote_code=True,
+                local_files_only=model_exists_locally,  # 如果是新下载的，允许在线检查
+            )
+        except Exception as e:
+            del model
+            torch.cuda.empty_cache()
+            raise RuntimeError(f"加载处理器失败: {e}")
+
+        print(f"成功加载模型: {model_name}")
+        return (QwenModel(model, processor, device, original_params),)
+
+
 NODE_CLASS_MAPPINGS = {
     "DownloadAndLoadQwenModel": DownloadAndLoadQwenModel,
     "QwenVLDetection": QwenVLDetection,
@@ -992,6 +1137,7 @@ NODE_CLASS_MAPPINGS = {
     "QwenSortBBoxes": QwenSortBBoxes,
     "QwenBBoxesToSAM2": QwenBBoxesToSAM2,
     "QwenObjectDetection": QwenObjectDetection,
+    "QwenLoadLocalModel": QwenLoadLocalModel,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -1003,4 +1149,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "QwenSortBBoxes": "Qwen Sort Bounding Boxes",
     "QwenBBoxesToSAM2": "Qwen Prepare BBoxes for SAM2",
     "QwenObjectDetection": "Qwen Object Detection",
+    "QwenLoadLocalModel": "Qwen Load Local Model",
 }

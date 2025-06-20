@@ -1128,6 +1128,185 @@ class QwenLoadLocalModel:
         return (QwenModel(model, processor, device, original_params),)
 
 
+class QwenDownloadModel:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model_name": ([
+                    "Qwen/Qwen2.5-VL-3B-Instruct",
+                    "Qwen/Qwen2.5-VL-7B-Instruct",
+                    "Qwen/Qwen2.5-VL-32B-Instruct",
+                    "Qwen/Qwen2.5-VL-72B-Instruct",
+                ], ),
+                "device": ([
+                    "auto",
+                    "cuda:0",
+                    "cuda:1",
+                    "cpu",
+                ], ),
+                "precision": ([
+                    "INT4",
+                    "INT8",
+                    "BF16",
+                    "FP16",
+                    "FP32",
+                ], ),
+                "attention": ([
+                    "flash_attention_2",
+                    "sdpa",
+                ], ),
+                "offline_mode": ("BOOLEAN", {"default": False}),
+            }
+        }
+
+    RETURN_TYPES = ("QWEN_MODEL",)
+    RETURN_NAMES = ("qwen_model",)
+    FUNCTION = "load"
+    CATEGORY = "Qwen2.5-VL"
+
+    def load(self, model_name: str, device: str, precision: str, attention: str, offline_mode: bool = False):
+        # 保存原始参数，用于后续可能的重新加载
+        original_params = {
+            "model_name": model_name,
+            "device": device,
+            "precision": precision,
+            "attention": attention,
+            "offline_mode": offline_mode
+        }
+        model_dir = os.path.join(folder_paths.models_dir, "Qwen", model_name.replace("/", "_"))
+        
+        # 检查本地目录是否已存在
+        model_exists_locally = os.path.exists(model_dir) and any(os.listdir(model_dir))
+        
+        # 离线模式或在线模式下载逻辑
+        if not offline_mode and not model_exists_locally:
+            # 添加重试逻辑来处理SSL错误
+            max_retries = 3
+            retry_delay = 5  # 秒
+            success = False
+            
+            for attempt in range(max_retries):
+                try:
+                    # Always attempt download with resume enabled so an interrupted download
+                    # can be continued when the node is executed again.
+                    snapshot_download(
+                        repo_id=model_name,
+                        local_dir=model_dir,
+                        local_dir_use_symlinks=False,
+                        resume_download=True,
+                    )
+                    success = True
+                    break
+                except (requests.exceptions.SSLError, requests.exceptions.ConnectionError) as e:
+                    if attempt < max_retries - 1:
+                        print(f"SSL/连接错误，将在{retry_delay}秒后重试 ({attempt+1}/{max_retries})...")
+                        print(f"错误详情: {e}")
+                        time.sleep(retry_delay)
+                        retry_delay *= 2  # 指数退避策略
+                    else:
+                        print(f"下载模型失败，已达到最大重试次数。尝试使用本地缓存。错误: {e}")
+                        # 尝试直接从本地加载，如果有缓存的话
+                except Exception as e:
+                    print(f"下载时发生其他错误: {e}")
+                    traceback.print_exc()
+                    if attempt < max_retries - 1:
+                        print(f"将在{retry_delay}秒后重试...")
+                        time.sleep(retry_delay)
+                        retry_delay *= 2
+                    else:
+                        print("已达到最大重试次数，尝试使用本地缓存。")
+        elif offline_mode and model_exists_locally:
+            print(f"离线模式: 使用本地模型，不进行在线检查 '{model_dir}'")
+        elif offline_mode and not model_exists_locally:
+            raise ValueError(f"离线模式: 本地模型不存在 '{model_dir}'。请先在线模式下载模型。")
+        else:
+            print(f"使用现有本地模型 '{model_dir}'")
+                
+        if device == "auto":
+            device_map = "auto"
+        elif device == "cpu":
+            device_map = {"": "cpu"}
+        else:
+            device_map = {"": device}
+
+        precision = precision.upper()
+        dtype_map = {
+            "BF16": torch.bfloat16,
+            "FP16": torch.float16,
+            "FP32": torch.float32,
+        }
+        torch_dtype = dtype_map.get(precision, torch.bfloat16)
+        quant_config = None
+        if precision == "INT4":
+            quant_config = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_use_double_quant=True)
+        elif precision == "INT8":
+            quant_config = BitsAndBytesConfig(load_in_8bit=True)
+
+        attn_impl = attention
+        if precision == "FP32" and attn_impl == "flash_attention_2":
+            # FlashAttention doesn't support fp32. Fall back to SDPA.
+            attn_impl = "sdpa"
+
+        # 添加重试逻辑用于模型加载
+        max_model_load_retries = 3
+        model_retry_delay = 3
+        
+        for attempt in range(max_model_load_retries):
+            try:
+                model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                    model_dir,
+                    torch_dtype=torch_dtype,
+                    quantization_config=quant_config,
+                    device_map=device_map,
+                    attn_implementation=attn_impl,
+                    trust_remote_code=True,
+                    use_cache=True,
+                    local_files_only=offline_mode,  # 离线模式下仅使用本地文件
+                )
+                break
+            except OSError:
+                if attempt < max_model_load_retries - 1 and not offline_mode:
+                    print(f"加载模型失败，尝试重新下载 ({attempt+1}/{max_model_load_retries})...")
+                    try:
+                        # Force a re-download and try again.
+                        snapshot_download(
+                            repo_id=model_name,
+                            local_dir=model_dir,
+                            local_dir_use_symlinks=False,
+                            resume_download=True,
+                            force_download=True,
+                        )
+                        time.sleep(model_retry_delay)
+                        model_retry_delay *= 2
+                    except Exception as e:
+                        print(f"重新下载时发生错误: {e}")
+                else:
+                    if offline_mode:
+                        print("离线模式: 本地模型文件可能损坏或不完整。")
+                    else:
+                        print("已达到最大重试次数，无法加载模型。")
+                    raise
+            except Exception as e:
+                if "SSL" in str(e) and attempt < max_model_load_retries - 1 and not offline_mode:
+                    print(f"SSL错误，将在{model_retry_delay}秒后重试...")
+                    time.sleep(model_retry_delay)
+                    model_retry_delay *= 2
+                else:
+                    # Surface any other errors (e.g. missing flash_attn)
+                    print(f"加载模型时发生错误: {str(e)}")
+                    raise
+        
+        # 加载处理器
+        try:
+            processor = AutoProcessor.from_pretrained(model_dir, trust_remote_code=True, local_files_only=offline_mode)
+        except Exception as e:
+            print(f"加载处理器时发生错误: {str(e)}")
+            raise
+            
+        return (QwenModel(model=model, processor=processor, device=device, original_params=original_params),)
+
+
 NODE_CLASS_MAPPINGS = {
     "DownloadAndLoadQwenModel": DownloadAndLoadQwenModel,
     "QwenVLDetection": QwenVLDetection,
@@ -1138,6 +1317,7 @@ NODE_CLASS_MAPPINGS = {
     "QwenBBoxesToSAM2": QwenBBoxesToSAM2,
     "QwenObjectDetection": QwenObjectDetection,
     "QwenLoadLocalModel": QwenLoadLocalModel,
+    "QwenDownloadModel": QwenDownloadModel,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -1150,4 +1330,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "QwenBBoxesToSAM2": "Qwen Prepare BBoxes for SAM2",
     "QwenObjectDetection": "Qwen Object Detection",
     "QwenLoadLocalModel": "Qwen Load Local Model",
+    "QwenDownloadModel": "Qwen Download Model",
 }
